@@ -83,12 +83,12 @@ unsigned long cmdStartTime = 0;           // Global to store the start time of c
 #define NEXT_NONE = 0;              // no new command; if pilot is on, we balance towards targetPosition
 #define NEXT_EXTINGUISH = 1;        // extinguish, turn it off
 #define NEXT_IGNITE = 2;            // ignite, turn it on
-//#define NEXT_POSITION = 4;         // move to a position
 unsigned int nextCmd = NEXT_NONE;   // Global to hold the next command after current one finishes
 
 
 unsigned long currentPosition = 0;        // position where we currently are, in millis between closed and fully open
-unsigned long targetPosition = 0;         // target position to move to if NEXT_POSITION is set.
+unsigned long targetPositionPerc = 0;     // target position to move to (in %).
+unsigned long targetPositionMillis = 0;   // target position to move to (in millis).
 
 
 
@@ -132,10 +132,15 @@ void setupThermocouple() {
   if (!thermocouple.begin()) {
     logMessage("ERROR: Initializing thermocouple failed!");
     errorState = errorState & THERMOCOUPLE_INIT_FAILED;
-  } else {
-    logMessage("Thermocouple initialzied");
-    errorState = errorState & ~THERMOCOUPLE_INIT_FAILED;
+    return;
   }
+
+  logMessage("Thermocouple initialzied");
+  errorState = errorState & ~THERMOCOUPLE_INIT_FAILED;
+  // read thermo couple, check, wait and check again, to handle time roll-overs
+  checkPilotStatus();
+  delay(THERMOCOUPLE_INTERVAL + 50);
+  checkPilotStatus();
 }
 
 
@@ -237,20 +242,6 @@ bool isPilotOn() {
 }
 
 
-// Function to report the error state to the user.
-// This function should be called in the loop, to report any errors to the user.
-// It will only report the changes in errorState, unless force = true, then all will be handled.
-void reportErrorState(force) { // TODO: this isn't thermocouple specific, so move it to a more general place
-  static unsigned long lastReportedErrorState = 0; // initialize to all being set
-
-  // TODO: implement
-
-  reportedOnce = true;
-  lastReportedErrorState = errorState;
-}
-
-
-
 // ----------------------------------------------------------------------------------
 //   Commands
 // ----------------------------------------------------------------------------------
@@ -292,6 +283,7 @@ void resetCmdStartTime() {
 }
 
 
+// DO NOT call this directly, use resetCmdStartTime() instead.
 // update the curent position based on the delta provided.
 // Will ensure the position stays between 0 and POSITION_RANGE_MAX.
 void updateCurrentPosition(long delta) {
@@ -373,85 +365,167 @@ void startLowerCommand() {
 }
 
 
+// Sets the target position to move to, in % (0-100)
+// Will calculate the targetPositionMillis between POSITION_USER_MIN and POSITION_USER_MAX.
+// Exception: if target is less than 1% then it will be set to 0 to close the valve.
+//
+// It will not change any commands, just set the target.
+void setTargetPositionPerc(int newTarget) {
+  if (newTarget > 100) newTarget = 100;
+  if (newTarget < 0)   newTarget = 0;
+
+  if (newTarget == 0) {
+    targetPositionPerc = 0;
+    targetPositionMillis = 0;
+  } else {
+    targetPositionPerc = newTarget;
+    targetPositionMillis = map(newTarget,
+        1, 100,
+        max(0, POSITION_USER_MIN), min(POSITION_USER_MAX, POSITION_RANGE_MAX)
+    );
+  }
+}
+
+
+// returns the current target position in 0-100%.
+void getTargetPositionPerc() {
+  return targetPositionPerc;
+}
+
+
 void checkCommandStatus() {
   // Handle current status, check elapsed time and update
   switch (currentCmdState) {
 
     case CMD_EXTINGUISH:
-      if (getElapsedMillis() > 1000) {
-        // Off command is complete, stop the command and move to the delay state
+      if (getElapsedMillis() >= 1000) {
+        // Extinguish command is complete, stop the command and move to the delay state
         endCommand();
         currentCmdState = CMD_EXTINGUISH_DELAY;
       }
-      break;
+      return; // nothing more to do here
+
 
     case CMD_EXTINGUISH_DELAY:
-      if (getElapsedMillis() > EXTINGUISH_WAIT_DELAY) {
-        // Extinguish command is complete, delay has passed, so we're idle now
-        currentCmdState = CMD_IDLE;
+      if (getElapsedMillis() < EXTINGUISH_WAIT_DELAY) {
+        // waiting for the extinguish delay to pass, so we're done for now
+        return;
       }
+      // Extinguish command is complete, delay has passed, so we're idle now
+      currentPosition = POSITION_AFTER_IGNITE;
+      currentCmdState = CMD_IDLE;
       break;
 
+
     case CMD_IGNITE:
-      if (getElapsedMillis() > 1000) {
+      if (getElapsedMillis() >= 1000) {
         // Ignite command is complete, stop the command and move to the delay state
         endCommand();
         currentCmdState = CMD_IGNITE_DELAY;
       }
-      break;
+      return; // nothing more to do here
+
 
     case CMD_IGNITE_DELAY:
-      if (getElapsedMillis() > IGNITE_WAIT_DELAY) {
-        // Ignite command is complete, delay has passed, so we're idle now
-        currentCmdState = CMD_IDLE;
+      if (getElapsedMillis() < IGNITE_WAIT_DELAY) {
+        // waiting for the ignite delay to pass, so we're done for now
+        return;
       }
+      // Ignite command is complete, delay has passed, so we're idle now
+      currentCmdState = CMD_IDLE;
       break;
+
 
     case CMD_HIGHER:
-      // TODO: implement
-      break;
-
     case CMD_LOWER:
-      // TODO: implement
-      break;
-  }
+      // So we seem to be balancing towards a specific position
+      resetCmdStartTime();  // update the currentPosition
 
-  // If we're not idle, we're done for now
-  if (currentCmdState != CMD_IDLE) {
-    return;
-  }
+      // we only balance if the pilot is on, otherwise we stay put
+      if (isPilotOn()) {
+        if (currentPosition > targetPositionMillis - POSITION_PRECISION/2 &&
+            currentPosition < targetPositionMillis + POSITION_PRECISION/2) {
+          // we're on target position, so we're done
+          endCommand();
 
-  // So we're idle, check for next commands
-  switch (nextCmd) {
-    case NEXT_IGNITE:
-      if (!isPilotOn()) {   // only ignite if we're not already on
-        startIgniteCommand();
-        currentPosition = POSITION_AFTER_IGNITE;
+        } elseif (getElapsedMillis() > targetPositionMillis) {
+          // we're too high, so switch to lower if not already doing so
+          if (currentCmdState != CMD_LOWER) {
+            startLowerCommand();
+          }
+
+        } elseif (getElapsedMillis() < targetPositionMillis) {
+          // we're too low, so switch to higher if not already doing so
+          if (currentCmdState != CMD_HIGHER) {
+            startHigherCommand();
+          }
+        }
       }
+      break;
+  }  // end switch (currentCmdState)
+
+
+  // By now we are either balancing (HIGHER/LOWER) or we're IDLE
+  // so check if there is another command to run
+  switch (nextCmd) {
+
+    case NEXT_IGNITE:
       nextCmd = NEXT_NONE;
+      if (!isPilotOn()) startIgniteCommand();  // only ignite if we're not already on
       break;
 
     case NEXT_EXTINGUISH:
-      if (isPilotOn()) {   // only turn off if we're on
-        startExtinguishCommand();
-        currentPosition = 0;
-      }
       nextCmd = NEXT_NONE;
+      startExtinguishCommand();  // extinguish we always run, even if pilot is off, for safety.
       break;
 
-    case NEXT_POSITION:
-      if (isPilotOn()) {
-        if (currentPosition < targetPosition && currentPosition < (targetPosition - POSITION_PRECISION)) {
-          // we must run up
-          startHigherCommand();
-        } else if (currentPosition > targetPosition && currentPosition > (targetPosition + POSITION_PRECISION)) {
-          // we must run down
-          startLowerCommand();
-        }
-      }
-      nextCmd = NEXT_NONE;
-      break;
+  } // end switch (nextCmd)
+}
+
+
+// ----------------------------------------------------------------------------------
+//   Reporting stuff to the user
+// ----------------------------------------------------------------------------------
+
+
+// Function to report the error state to the user using Homie5 Alerts
+// This function should be called in the loop, to report any errors to the user.
+// It will only report the changes in errorState, unless force = true, then all will be handled.
+void reportErrorState(force) {
+  static unsigned long lastReportedErrorState = 0;
+  if (!force && errorState == lastReportedErrorState) {
+    return;  // no changes, nothing to report
   }
+
+  // TODO: implement
+  // TODO: upon connecting to mqtt, we need to run this with force = true, to report all errors to the user (and clear old ones)
+
+  lastReportedErrorState = errorState;
+}
+
+
+// Get status of the fire-place, returns a string with the current user-facing status.
+// Possible values are: "off", "pilot", "on", "igniting", "extinguishing"
+String getStatus() {
+  switch (currentCmdState) {
+    case CMD_EXTINGUISH:
+    case CMD_EXTINGUISH_DELAY:
+      return "extinguishing";
+
+    case CMD_IGNITE:
+    case CMD_IGNITE_DELAY:
+      return "igniting";
+  }
+
+  if (!isPilotOn()) {
+    return "off";
+  }
+
+  if (gettargetPositionPerc() == 0) {
+    return "pilot";
+  }
+
+  return "on";
 }
 
 
@@ -460,16 +534,12 @@ void checkCommandStatus() {
 // ----------------------------------------------------------------------------------
 
 
+// runs once at strtup
 void setup() {
   errorState = 0;  // disable all error flags
   setupLogging();
   setupRelais();
-
-  // read thermo couple, check, wait and check again, to handle time roll-overs
-  // TODO: move this into thermocouple initialization
-  checkPilotStatus();
-  delay(THERMOCOUPLE_INTERVAL);
-  checkPilotStatus();
+  setupThermocouple();
 }
 
 
@@ -477,6 +547,7 @@ void setup() {
 void loop() {
   checkPilotStatus();     // read thermocouple and set status
   checkCommandStatus();
+  reportErrorState(false);  // report any errors to the user
 
   startIgniteCommand();
   delay(2000);
@@ -488,4 +559,9 @@ void loop() {
   delay(2000);
   endCommand();
   delay(4000);
+
+  // Wait for a while, minimum POSITION_PRECISION/4 to ensure we can move the valve
+  // without keeping flipping between HIGHER and LOWER.
+  // Maximum wait is 100ms to remain responsive to user commands.
+  delay(max(POSITION_PRECISION/4, 100));
 }
