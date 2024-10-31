@@ -10,7 +10,20 @@
 #define TIESKE_MQTT_PORT 1883
 
 // DeviceID, used to connect to MQTT server as well as the Homie Device ID
-#define TIESKE_DEVICE_ID "wtw-ventilatie"
+#define TIESKE_DEVICE_ID "mertik-maxitrol"
 
 // The baud rate to use for logging to the serial console
 #define SERIAL_BAUD_RATE 115200
+
+
+// BOARD SETUP
+
+// Digital output GPIO pins used for each relais
+#define RELAIS1 16
+#define RELAIS2 4
+#define RELAIS3 5
+
+// MAX31855 thermocouple reader, software SPI using the following digital GPIO pins
+#define MAXDO   12  // Data Out in the breakout, MISO on the controllerboard
+#define MAXCS   13  // Chip Select in the breakout, CS on the controllerboard
+#define MAXCLK  14  // Clock in the breakout, SCK on the controllerboard

@@ -41,6 +41,8 @@ Commands:
 
 
 #include <SPI.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 #include "Adafruit_MAX31855.h"
 #include "mertik-maxitrol.h"        // Check this file for setup and secrets !!!!!
 
@@ -69,27 +71,32 @@ unsigned long errorState = 0;
 #define THERMOCOUPLE_MAX_ERROR    5  // minimum number of consequtive errors to consider as a fault (reading taemp, as well as range check)
 
 
-#define CMD_IDLE = 0;              // no command is in progress
-#define CMD_EXTINGUISH = 1;        // extinguish command was set, and waiting for delay to pass
-#define CMD_EXTINGUISH_DELAY = 2;  // extinguish command was finished, now waiting for motor/valve to return to off-position, and thermo-couple to report off
-#define CMD_IGNITE = 4;            // ignite command was set, and waiting for command delay to pass
-#define CMD_IGNITE_DELAY = 8;      // ignite command was finished, now waiting for start procedure to finish
-#define CMD_HIGHER = 16;           // Valve is running to open currently
-#define CMD_LOWER = 32;            // Valve is running to close currently
+#define CMD_IDLE                  0  // no command is in progress
+#define CMD_EXTINGUISH            1  // extinguish command was set, and waiting for delay to pass
+#define CMD_EXTINGUISH_DELAY      2  // extinguish command was finished, now waiting for motor/valve to return to off-position, and thermo-couple to report off
+#define CMD_IGNITE                4  // ignite command was set, and waiting for command delay to pass
+#define CMD_IGNITE_DELAY          8  // ignite command was finished, now waiting for start procedure to finish
+#define CMD_HIGHER               16  // Valve is running to open currently
+#define CMD_LOWER                32  // Valve is running to close currently
 unsigned int currentCmdState = CMD_IDLE;  // Global to hold current state of the commands
 unsigned long cmdStartTime = 0;           // Global to store the start time of commands currently set
 
 
-#define NEXT_NONE = 0;              // no new command; if pilot is on, we balance towards targetPosition
-#define NEXT_EXTINGUISH = 1;        // extinguish, turn it off
-#define NEXT_IGNITE = 2;            // ignite, turn it on
-unsigned int nextCmd = NEXT_NONE;   // Global to hold the next command after current one finishes
+#define NEXT_NONE                 0  // no new command; if pilot is on, we balance towards targetPosition
+#define NEXT_EXTINGUISH           1  // extinguish, turn it off
+#define NEXT_IGNITE               2  // ignite, turn it on
+unsigned int nextCmd = NEXT_NONE;    // Global to hold the next command after current one finishes
 
 
 unsigned long currentPosition = 0;        // position where we currently are, in millis between closed and fully open
 unsigned long targetPositionPerc = 0;     // target position to move to (in %).
 unsigned long targetPositionMillis = 0;   // target position to move to (in millis).
 
+
+// Homie and network
+WiFiClient espClient;
+PubSubClient client(espClient);
+String deviceId = TIESKE_DEVICE_ID;
 
 
 // ----------------------------------------------------------------------------------
@@ -113,6 +120,54 @@ void logMessage(const char *format, ...) {
   va_end(args);
 
   Serial.println(logBuffer);
+}
+
+
+// ----------------------------------------------------------------------------------
+//   WiFi connection
+// ----------------------------------------------------------------------------------
+
+
+void wifiSetup()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(TIESKE_WIFI_SSID, TIESKE_WIFI_PASSWORD);
+}
+
+
+// DO NOT call this directly, use checkMQTT() instead.
+// check the wifi connection and reconnects if needed.
+// returns the current status of the wifi connection.
+wl_status_t wifiCheck() {
+  static unsigned long lastWifiCheck = 0;
+  static wl_status_t lastStatus = WL_IDLE_STATUS;
+
+  unsigned long now = millis();
+  wl_status_t currentStatus = WiFi.status();
+
+  if (currentStatus != lastStatus) {
+    logMessage("WiFi status changed from %d to %d", lastStatus, currentStatus);
+    lastStatus = currentStatus;
+    return currentStatus;
+  }
+
+  // Connected is ok, IDLE means it is in between retries
+  if (currentStatus == WL_CONNECTED || currentStatus == WL_IDLE_STATUS) {
+    if (currentStatus == WL_CONNECTED && lastStatus == WL_CONNECTED) {
+      logMessage("WiFi connected. IP address: %s", WiFi.localIP().toString());
+    }
+    lastStatus = currentStatus;
+    lastWifiCheck = now;
+    return currentStatus;  // nothing to do here
+  }
+
+  if (now - lastWifiCheck < 5000) {
+    return;  // not time yet
+  }
+  lastWifiCheck = now;
+
+  wifiSetup(); // retry connecting
+  return currentStatus;
 }
 
 
@@ -161,7 +216,7 @@ void checkPilotStatus() {
 
   // check if it's time to check the thermocouple
   unsigned long elapsedSince = millis() - lastCheck; // Using subtraction handles roll-over automatically
-  if (elapsedSince < THERMOCOUPLE_INTERVAL); {
+  if (elapsedSince < THERMOCOUPLE_INTERVAL) {
     return;  // not time yet
   }
   lastCheck = millis();
@@ -272,10 +327,10 @@ void resetCmdStartTime() {
   unsigned long msecs = millis();
   long elapsed = msecs - cmdStartTime;
 
-  if (currentCmdState == CMD_HIGHER);{
+  if (currentCmdState == CMD_HIGHER) {
     updateCurrentPosition(elapsed);          // add elapsed time
   }
-  if (currentCmdState == CMD_LOWER);{
+  if (currentCmdState == CMD_LOWER) {
     updateCurrentPosition(-1 * elapsed);     // subtract elapsed time
   }
 
@@ -448,13 +503,13 @@ void checkCommandStatus() {
           // we're on target position, so we're done
           endCommand();
 
-        } elseif (getElapsedMillis() > targetPositionMillis) {
+        } else if (getElapsedMillis() > targetPositionMillis) {
           // we're too high, so switch to lower if not already doing so
           if (currentCmdState != CMD_LOWER) {
             startLowerCommand();
           }
 
-        } elseif (getElapsedMillis() < targetPositionMillis) {
+        } else if (getElapsedMillis() < targetPositionMillis) {
           // we're too low, so switch to higher if not already doing so
           if (currentCmdState != CMD_HIGHER) {
             startHigherCommand();
@@ -504,9 +559,10 @@ void reportErrorState(force) {
 }
 
 
-// Get status of the fire-place, returns a string with the current user-facing status.
-// Possible values are: "off", "pilot", "on", "igniting", "extinguishing"
-String getStatus() {
+// Get status of the pilot-flame according to the command cycle.
+// Returns a string with the current user-facing status.
+// Possible values are: "off", "igniting", "on", "extinguishing"
+String getPilotCmdStatus() {
   switch (currentCmdState) {
     case CMD_EXTINGUISH:
     case CMD_EXTINGUISH_DELAY:
@@ -521,11 +577,287 @@ String getStatus() {
     return "off";
   }
 
-  if (gettargetPositionPerc() == 0) {
-    return "pilot";
+  return "on";
+}
+
+
+// Returns the status of the pilot-flame according to the thermocouple.
+// Returns a string with the current user-facing status.
+// Possible values are: "off", "on"
+String getPilotStatus() {
+  return isPilotOn() ? "on" : "off";
+}
+
+
+// ----------------------------------------------------------------------------------
+//   MQTT setup
+// ----------------------------------------------------------------------------------
+
+
+void setupMQTT() {
+  client.setServer(TIESKE_MQTT_SERVER, TIESKE_MQTT_PORT);
+  client.setCallback(callback);
+}
+
+
+// Returns the nth segment of a topic string, where segments are separated by '/'.
+// 0-indexed. If the index is out of bounds, an empty string is returned.
+String getTopicSegment(String topic, int index) {
+  const char* topicCStr = topic.c_str();
+  int segmentCount = 0;
+  const char* startPtr = topicCStr;
+
+  // Traverse through the topic string
+  for (const char* ptr = topicCStr; *ptr != '\0'; ++ptr) {
+    if (*ptr == '/') {
+      if (segmentCount == index) {
+        return String(startPtr, ptr - startPtr);
+      }
+      // Move to the start of the next segment
+      segmentCount++;
+      startPtr = ptr + 1;
+    }
   }
 
-  return "on";
+  // Handle the last segment (if no trailing slash)
+  if (segmentCount == index) {
+    return String(startPtr);
+  }
+
+  // Index out of bounds, return an empty string
+  return "";
+}
+
+
+// Check if a received payload is a float
+bool isFloat(const String& value) {
+  char* endPtr;
+  float result = strtof(value.c_str(), &endPtr);
+  return *endPtr == '\0';
+}
+
+// Callback handling subscribed topic values received
+void callback(char* topic, byte* payload, unsigned int length) {
+  //logMessage("received MQTT data");
+  if (length > 20) { // we expect: true, false, or number 0:100:1
+    logMessage("received MQTT payload is too long: %d", length);
+    return;
+  }
+
+  payload[length] = '\0'; // Null-terminate the payload
+  String value = String((char*)payload);
+  // segements 0,1,2 are: "homie/5/" + deviceId
+  String nodeId = getTopicSegment(String(topic), 3);
+  String propId = getTopicSegment(String(topic), 4);
+
+  // select by NodeId
+  switch (nodeId) {
+
+    case "pilot":
+      // select by PropertyId
+      switch (propId) {
+        case "value":       // handle topic: ../pilot/value/set
+          if (value != "true" && value != "false") {
+            logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+            return;
+          }
+
+          // post value on $target attribute
+          writeTopic("homie/5/" + deviceId + "/pilot/value/$target", value, true);
+
+          // either ignite or extinguish based on the value
+          if (value == "true") {
+            nextCmd = NEXT_IGNITE;
+          } else {
+            nextCmd = NEXT_EXTINGUISH;
+          }
+          return;
+
+        default:
+          logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
+      }
+      break;
+
+
+    case "burner":
+      // select by PropertyId
+      switch (propId) {
+        case "value":       // handle topic: ../level/value/set
+          if (!isFloat(value)) {
+            logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+            return;
+          }
+
+          // convert value to a float and round it to the nearest integer
+          int newTarget = round(value.toFloat());
+          if (newTarget < 0 || newTarget > 100) {
+            logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+            return;
+          }
+
+          // we're accepting the value, post on $target attribute, and update internal value
+          writeTopic("homie/5/" + deviceId + "/burner/value/$target", value, true);
+          setTargetPositionPerc(newTarget);
+          break;
+
+        default:
+          logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
+      }
+      break;
+
+
+    default:
+      logMessage("received value on unknown node: '%s/%s/set'", nodeId, propId);
+  }
+
+}
+
+
+void writeTopic(String topic, String value, bool retain) {
+  client.publish(topic.c_str(), value.c_str(), retain);
+}
+
+// // Function to send large MQTT payload in chunks using beginPublish(), write(), and endPublish()
+// // Returns true if successful, false if any error occurs
+// bool writeTopic(String topic, String payload, bool retain) {
+//   size_t totalLength = payload.length();
+//   size_t chunkSize = MQTT_MAX_TRANSFER_SIZE - 215 // accomodate for max 15 bytes overhead
+
+//   if (!client.beginPublish(topic.c_str(), totalLength, retain)) {
+//     logMessage("Error: Failed to begin publishing to topic %s", topic.c_str());
+//     return false;
+//   }
+
+//   for (size_t i = 0; i < totalLength; i += chunkSize) {
+//     size_t remainingLength = totalLength - i;
+//     size_t lengthToSend = min(chunkSize, remainingLength);
+
+//     if (client.write((const uint8_t*)payload.c_str() + i, lengthToSend) != lengthToSend) {
+//       logMessage("Error: Failed to send chunk to topic %s", topic.c_str());
+//       client.endPublish();  // Ensure publishing is properly terminated
+//       return false;
+//     }
+//   }
+
+//   if (!client.endPublish()) {
+//     logMessage("Error: Failed to end publishing to topic %s", topic.c_str());
+//     return false;
+//   }
+
+//   return true;
+// }
+
+
+// Write the Homie description to the MQTT topics and subscribe to topics
+void publishHomieDeviceDescription() {
+  // mark device for (re)configuration
+  writeTopic("homie/5/" + deviceId + "/$state",                "init", true);
+
+  /* send device description, we're sending the minified and escaped version, the full version is:
+  {
+    "name": "Smart Fireplace",
+    "homie": "5.0",
+    "version": 1,
+    "nodes": {
+      "pilot": {
+        "properties": {
+          "value": {
+            "datatype": "boolean",
+            "format": "off,on",
+            "settable": true,
+            "retained": true
+          },
+          "status": {
+            "datatype": "enum",
+            "format": "off,igniting,on,extinguishing",
+            "settable": false,
+            "retained": true
+          }
+        }
+      },
+      "burner": {
+        "properties": {
+          "value": {
+            "datatype": "float",
+            "format": "0:100:1",
+            "settable": true,
+            "retained": true,
+            "unit": "%"
+          }
+        }
+      }
+    }
+  }
+  */
+
+  // TODO: send this in chunks, it's too large for a single publish
+  writeTopic("homie/5/" + deviceId + "/$description",
+    "{\"name\":\"Smart Fireplace\",\"homie\":\"5.0\",\"version\":1,\"nodes\":{\"pilot\":{\"properties\":{\"value\":{\"datatype\":\"boolean\",\"format\":\"off,on\",\"settable\":true,\"retained\":true},\"status\":{\"datatype\":\"enum\",\"format\":\"off,igniting,on,extinguishing\",\"settable\":false,\"retained\":true}}},\"burner\":{\"properties\":{\"value\":{\"datatype\":\"float\",\"format\":\"0:100:1\",\"settable\":true,\"retained\":true,\"unit\":\"%\"}}}}}",
+    true);
+
+  // publish current state
+  writeTopic("homie/5/" + deviceId + "/pilot/value/$target", getPilotStatus(), true);
+  writeTopic("homie/5/" + deviceId + "/pilot/value", getPilotStatus(), true);
+  writeTopic("homie/5/" + deviceId + "/pilot/status", getPilotCmdStatus(), true);
+
+  String targetPos = String(getTargetPositionPerc());
+  writeTopic("homie/5/" + deviceId + "/flames/value/$target", targetPos, true);
+  writeTopic("homie/5/" + deviceId + "/flames/value", targetPos, true);
+
+  // subscribe to setter topics
+  client.subscribe("homie/5/" + deviceId + "/*/*/set", 1);  // QoS level 1; at least once
+
+  // Mark device as ready
+  writeTopic("homie/5/" + deviceId + "/$state", "ready", true);
+}
+
+
+// DO NOT call this directly, use checkMQTT() instead.
+// Reconncts to MQTT broker, using the global settings.
+// Returns true if the connection was successful, false otherwise.
+bool reconnectMQTT() {
+  // only try once every 10 sconds
+  static unsigned long lastReconnectAttempt = 0;
+  if (millis() - lastReconnectAttempt < 10000) {
+    return false; // Not time to retry yet
+  }
+  lastReconnectAttempt = millis();
+
+  if (!client.connect(
+        TIESKE_DEVICE_ID,
+        TIESKE_MQTT_USER,
+        TIESKE_MQTT_PASSWORD,
+        ("homie/5/" + deviceId + "/$state").c_str(),  // LWT: topic
+        1,                                            // LWT: QoS
+        true,                                         // LWT: retain
+        "lost",                                       // LWT: value
+        false))                                       // no clean session
+    {
+    logMessage("Failed to connect to MQTT broker, rc=%d", client.state());
+    return false;
+  }
+
+  logMessage("Connected to MQTT broker");
+  publishHomieDeviceDescription();
+  return true;
+}
+
+
+// checks the MQTT connection and reconnects if needed. If connected does
+// a loop-step, so call this from the main loop.
+// returns the current status of the MQTT connection.
+bool checkMQTT() {
+  if (client.connected()) {
+    client.loop(); // do a loop-step, check messages, etc.
+    return true;
+  }
+
+  // check WiFI
+  if (wifiCheck() != WL_CONNECTED) {
+    return false;  // no wifi, no mqtt
+  }
+
+  return reconnectMQTT();
 }
 
 
@@ -540,25 +872,28 @@ void setup() {
   setupLogging();
   setupRelais();
   setupThermocouple();
+  wifiSetup();
+  setupMQTT();   // only set up, connect is automatic in the main loop
 }
 
 
 // the loop function runs over and over again forever
 void loop() {
-  checkPilotStatus();     // read thermocouple and set status
-  checkCommandStatus();
+  checkMQTT();              // step/connect/reconnect mqtt
+  checkPilotStatus();       // read thermocouple and set status
+  checkCommandStatus();     // main logic for fire-place control
   reportErrorState(false);  // report any errors to the user
 
-  startIgniteCommand();
-  delay(2000);
-  startHigherCommand();
-  delay(2000);
-  startLowerCommand();
-  delay(2000);
-  startExtinguishCommand();
-  delay(2000);
-  endCommand();
-  delay(4000);
+  // startIgniteCommand();
+  // delay(2000);
+  // startHigherCommand();
+  // delay(2000);
+  // startLowerCommand();
+  // delay(2000);
+  // startExtinguishCommand();
+  // delay(2000);
+  // endCommand();
+  // delay(4000);
 
   // Wait for a while, minimum POSITION_PRECISION/4 to ensure we can move the valve
   // without keeping flipping between HIGHER and LOWER.
