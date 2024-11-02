@@ -41,10 +41,11 @@ Commands:
 
 
 #include <SPI.h>
-#include <WiFi.h>
+//#include <WiFi.h>         // ESP32
+#include <ESP8266WiFi.h>  // ESP8266
 #include <PubSubClient.h>
-#include "Adafruit_MAX31855.h"
-#include "mertik-maxitrol.h"        // Check this file for setup and secrets !!!!!
+#include <Adafruit_MAX31855.h>
+#include "homie-mertik-maxitrol.h"        // Check this file for setup and secrets !!!!!
 
 
 // Error flags
@@ -135,6 +136,28 @@ void wifiSetup()
 }
 
 
+const char* getWiFiStatusString(int status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "IDLE";
+    case WL_NO_SSID_AVAIL:
+      return "NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:
+      return "SCAN_COMPLETED";
+    case WL_CONNECTED:
+      return "CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST:
+      return "CONNECTION_LOST";
+    case WL_DISCONNECTED:
+      return "DISCONNECTED";
+    default:
+      return "UNKNOWN_STATUS";
+  }
+}
+
+
 // DO NOT call this directly, use checkMQTT() instead.
 // check the wifi connection and reconnects if needed.
 // returns the current status of the wifi connection.
@@ -146,23 +169,23 @@ wl_status_t wifiCheck() {
   wl_status_t currentStatus = WiFi.status();
 
   if (currentStatus != lastStatus) {
-    logMessage("WiFi status changed from %d to %d", lastStatus, currentStatus);
+    logMessage("WiFi status changed from %s to %s", getWiFiStatusString(lastStatus), getWiFiStatusString(currentStatus));
+    if (currentStatus == WL_CONNECTED) {
+      logMessage("WiFi connected. IP address: %s", WiFi.localIP().toString().c_str());
+    }
     lastStatus = currentStatus;
     return currentStatus;
   }
 
   // Connected is ok, IDLE means it is in between retries
   if (currentStatus == WL_CONNECTED || currentStatus == WL_IDLE_STATUS) {
-    if (currentStatus == WL_CONNECTED && lastStatus == WL_CONNECTED) {
-      logMessage("WiFi connected. IP address: %s", WiFi.localIP().toString());
-    }
     lastStatus = currentStatus;
     lastWifiCheck = now;
     return currentStatus;  // nothing to do here
   }
 
   if (now - lastWifiCheck < 5000) {
-    return;  // not time yet
+    return lastStatus;  // not time yet
   }
   lastWifiCheck = now;
 
@@ -176,22 +199,21 @@ wl_status_t wifiCheck() {
 // ----------------------------------------------------------------------------------
 
 
-Adafruit_MAX31855 thermocouple;         // define the thermocouple object
-bool _pilotOnStatus = false;            // the current status of the pilot flame
+Adafruit_MAX31855 thermocouple(MAXCLK, MAXCS, MAXDO);  // initialize the thermocouple object
+bool _pilotOnStatus = false;                           // the current status of the pilot flame
 
 
 // Initialiation function for the thermocouple
 void setupThermocouple() {
-  thermocouple = Adafruit_MAX31855(MAXCLK, MAXCS, MAXDO);  // initialize the thermocouple object
   delay(500);                           // wait for MAX chip to stabilize at startup
   if (!thermocouple.begin()) {
     logMessage("ERROR: Initializing thermocouple failed!");
-    errorState = errorState & THERMOCOUPLE_INIT_FAILED;
+    errorState = errorState & THERMOCOUPLE_FAULT_INIT_FAILED;
     return;
   }
 
   logMessage("Thermocouple initialzied");
-  errorState = errorState & ~THERMOCOUPLE_INIT_FAILED;
+  errorState = errorState & ~THERMOCOUPLE_FAULT_INIT_FAILED;
   // read thermo couple, check, wait and check again, to handle time roll-overs
   checkPilotStatus();
   delay(THERMOCOUPLE_INTERVAL + 50);
@@ -210,7 +232,7 @@ void checkPilotStatus() {
   static unsigned long consecutiveRangeErrors = 0;
 
   // if initialization failed, skip the checks
-  if (errorState & THERMOCOUPLE_INIT_FAILED) {
+  if (errorState & THERMOCOUPLE_FAULT_INIT_FAILED) {
     return;  // initialization failed, nothing to do here
   }
 
@@ -443,7 +465,7 @@ void setTargetPositionPerc(int newTarget) {
 
 
 // returns the current target position in 0-100%.
-void getTargetPositionPerc() {
+unsigned long getTargetPositionPerc() {
   return targetPositionPerc;
 }
 
@@ -546,7 +568,7 @@ void checkCommandStatus() {
 // Function to report the error state to the user using Homie5 Alerts
 // This function should be called in the loop, to report any errors to the user.
 // It will only report the changes in errorState, unless force = true, then all will be handled.
-void reportErrorState(force) {
+void reportErrorState(bool force) {
   static unsigned long lastReportedErrorState = 0;
   if (!force && errorState == lastReportedErrorState) {
     return;  // no changes, nothing to report
@@ -611,7 +633,7 @@ String getTopicSegment(String topic, int index) {
   for (const char* ptr = topicCStr; *ptr != '\0'; ++ptr) {
     if (*ptr == '/') {
       if (segmentCount == index) {
-        return String(startPtr, ptr - startPtr);
+        return String(startPtr).substring(0, ptr - startPtr);
       }
       // Move to the start of the next segment
       segmentCount++;
@@ -638,7 +660,7 @@ bool isFloat(const String& value) {
 
 // Callback handling subscribed topic values received
 void callback(char* topic, byte* payload, unsigned int length) {
-  //logMessage("received MQTT data");
+  logMessage("received MQTT data on: %s", topic);
   if (length > 20) { // we expect: true, false, or number 0:100:1
     logMessage("received MQTT payload is too long: %d", length);
     return;
@@ -650,66 +672,57 @@ void callback(char* topic, byte* payload, unsigned int length) {
   String nodeId = getTopicSegment(String(topic), 3);
   String propId = getTopicSegment(String(topic), 4);
 
-  // select by NodeId
-  switch (nodeId) {
+  if (nodeId == "Pilot") {
 
-    case "pilot":
+    // select by PropertyId
+    if (propId == "value") {    // handle topic: ../pilot/value/set
+      if (value != "true" && value != "false") {
+        logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+        return;
+      }
+
+      // post value on $target attribute
+      writeTopic("homie/5/" + deviceId + "/pilot/value/$target", value, true);
+
+      // either ignite or extinguish based on the value
+      if (value == "true") {
+        nextCmd = NEXT_IGNITE;
+      } else {
+        nextCmd = NEXT_EXTINGUISH;
+      }
+
+    } else {
+      logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
+    }
+    
+
+  } else if (nodeId == "burner") {
       // select by PropertyId
-      switch (propId) {
-        case "value":       // handle topic: ../pilot/value/set
-          if (value != "true" && value != "false") {
-            logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
-            return;
-          }
-
-          // post value on $target attribute
-          writeTopic("homie/5/" + deviceId + "/pilot/value/$target", value, true);
-
-          // either ignite or extinguish based on the value
-          if (value == "true") {
-            nextCmd = NEXT_IGNITE;
-          } else {
-            nextCmd = NEXT_EXTINGUISH;
-          }
+      if (propId == "value") {      // handle topic: ../level/value/set
+        if (!isFloat(value)) {
+          logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
           return;
+        }
 
-        default:
-          logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
+        // convert value to a float and round it to the nearest integer
+        int newTarget = round(value.toFloat());
+        if (newTarget < 0 || newTarget > 100) {
+          logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+          return;
+        }
+
+        // we're accepting the value, post on $target attribute, and update internal value
+        writeTopic("homie/5/" + deviceId + "/burner/value/$target", value, true);
+        setTargetPositionPerc(newTarget);
+        
+      } else {
+        logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
       }
-      break;
 
 
-    case "burner":
-      // select by PropertyId
-      switch (propId) {
-        case "value":       // handle topic: ../level/value/set
-          if (!isFloat(value)) {
-            logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
-            return;
-          }
-
-          // convert value to a float and round it to the nearest integer
-          int newTarget = round(value.toFloat());
-          if (newTarget < 0 || newTarget > 100) {
-            logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
-            return;
-          }
-
-          // we're accepting the value, post on $target attribute, and update internal value
-          writeTopic("homie/5/" + deviceId + "/burner/value/$target", value, true);
-          setTargetPositionPerc(newTarget);
-          break;
-
-        default:
-          logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
-      }
-      break;
-
-
-    default:
-      logMessage("received value on unknown node: '%s/%s/set'", nodeId, propId);
+  } else {
+    logMessage("received value on unknown node: '%s/%s/set'", nodeId, propId);
   }
-
 }
 
 
@@ -805,7 +818,7 @@ void publishHomieDeviceDescription() {
   writeTopic("homie/5/" + deviceId + "/flames/value", targetPos, true);
 
   // subscribe to setter topics
-  client.subscribe("homie/5/" + deviceId + "/*/*/set", 1);  // QoS level 1; at least once
+  client.subscribe(("homie/5/" + deviceId + "/*/*/set").c_str(), 1);  // QoS level 1; at least once
 
   // Mark device as ready
   writeTopic("homie/5/" + deviceId + "/$state", "ready", true);
