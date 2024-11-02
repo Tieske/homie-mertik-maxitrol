@@ -58,18 +58,19 @@ unsigned long errorState = 0;
 
 
 // CONFIG PARAMETERS
-#define EXTINGUISH_WAIT_DELAY 10000  // Ofter extinguish command how long (in millis) to wait for valve motor to return to start position?
-#define IGNITE_WAIT_DELAY     10000  // Ofter Ignite command how long (in millis) to wait for fireplace to start and be ready to accept commands?
+// NOTE: the delays much be such that if IGNITE is send while extingishing, it will succesfully ignite right after. And vice versa. If not, increase the delay.
+#define EXTINGUISH_WAIT_DELAY 40000  // After extinguish command how long (in millis) to wait for valve motor to return to start position? AND thermocouple reporting OFF
+#define IGNITE_WAIT_DELAY     30000  // After Ignite command how long (in millis) to wait for fireplace to start and be ready to accept commands? Valve has reached its after-start-state.
 #define POSITION_PRECISION      100  // Positioning precision in millis
 #define POSITION_AFTER_IGNITE     0  // Where (in millis) are we after the ignite cycle?
 #define POSITION_RANGE_MAX    12000  // the interval between 100% closed and 100% open in millis
-#define POSITION_USER_MIN      2000  // minimum position to use in millis, user % is mapped between this and POSITION_USER_MAX
-#define POSITION_USER_MAX     10000  // maximum position to use in millis, user % is mapped between POSITION_USER_MIN and this
+#define POSITION_USER_MIN      1000  // minimum position to use in millis, user % is mapped between this and POSITION_USER_MAX
+#define POSITION_USER_MAX     12000  // maximum position to use in millis, user % is mapped between POSITION_USER_MIN and this
 #define THERMOCOUPLE_INTERVAL  1000  // interval (in millis) for reading thermocouple state (pilot on/off)
 #define THERMOCOUPLE_THRESHOLD   30  // threshold temperature (Celsius) to determine if pilot is on (above) or off (below)
 #define THERMOCOUPLE_MAX_TEMP   150  // maximum temperature (Celsius) to consider as valid reading
 #define THERMOCOUPLE_MIN_TEMP     5  // minimum temperature (Celsius) to consider as valid reading
-#define THERMOCOUPLE_MAX_ERROR    5  // minimum number of consequtive errors to consider as a fault (reading taemp, as well as range check)
+#define THERMOCOUPLE_MAX_ERROR    5  // minimum number of consequtive errors to consider as a fault (reading temp, as well as range check)
 
 
 #define CMD_IDLE                  0  // no command is in progress
@@ -203,6 +204,12 @@ Adafruit_MAX31855 thermocouple(MAXCLK, MAXCS, MAXDO);  // initialize the thermoc
 bool _pilotOnStatus = false;                           // the current status of the pilot flame
 
 
+// Returns a boolean indicating if the pilot flame is currently on or not.
+bool isPilotOn() {
+  return _pilotOnStatus;
+}
+
+
 // Initialiation function for the thermocouple
 void setupThermocouple() {
   delay(500);                           // wait for MAX chip to stabilize at startup
@@ -212,7 +219,7 @@ void setupThermocouple() {
     return;
   }
 
-  logMessage("Thermocouple initialzied");
+  logMessage("Thermocouple initialized");
   errorState = errorState & ~THERMOCOUPLE_FAULT_INIT_FAILED;
   // read thermo couple, check, wait and check again, to handle time roll-overs
   checkPilotStatus();
@@ -290,7 +297,7 @@ void checkPilotStatus() {
 
     // Handle error only if more than the threshold
     if (consecutiveRangeErrors >= THERMOCOUPLE_MAX_ERROR) {
-      logMessage("ERROR: Thermocouple reading out of range: %f", c);
+      logMessage("WARN: Thermocouple reading out of range: %f", c);
       errorState = errorState & THERMOCOUPLE_FAULT_RANGE;
 
       if (consecutiveRangeErrors == THERMOCOUPLE_MAX_ERROR) { // only log once (check for equality!)
@@ -308,14 +315,9 @@ void checkPilotStatus() {
   bool newState = (c > THERMOCOUPLE_THRESHOLD);
   if (newState != _pilotOnStatus) {
     logMessage("Pilot flame switched to %s", (newState ? "ON" : "OFF"));
+    writeTopic("homie/5/" + deviceId + "/pilot/value", (newState ? "true" : "false"), true);
     _pilotOnStatus = newState;
   }
-}
-
-
-// Returns a boolean indicating if the pilot flame is currently on or not.
-bool isPilotOn() {
-  return _pilotOnStatus;
 }
 
 
@@ -347,7 +349,7 @@ unsigned long getElapsedMillis() {
 // This function will update the current position, if the existing command was to move the valve (open or close).
 void resetCmdStartTime() {
   unsigned long msecs = millis();
-  long elapsed = msecs - cmdStartTime;
+  unsigned long elapsed = msecs - cmdStartTime;
 
   if (currentCmdState == CMD_HIGHER) {
     updateCurrentPosition(elapsed);          // add elapsed time
@@ -388,9 +390,10 @@ void endCommand() {
   digitalWrite(RELAIS1, HIGH);
   digitalWrite(RELAIS2, HIGH);
   digitalWrite(RELAIS3, HIGH);
+  unsigned long elapsed = getElapsedMillis();
   resetCmdStartTime();
   currentCmdState = CMD_IDLE;
-  logMessage("EndCommand set");
+  logMessage("EndCommand set after %d", elapsed);
 }
 
 
@@ -400,9 +403,11 @@ void startIgniteCommand() {
   digitalWrite(RELAIS1, LOW);
   digitalWrite(RELAIS2, HIGH);
   digitalWrite(RELAIS3, LOW);
+  unsigned long elapsed = getElapsedMillis();
   resetCmdStartTime();
   currentCmdState = CMD_IGNITE;
-  logMessage("IgniteCommand set");
+  writeTopic("homie/5/" + deviceId + "/pilot/status", "igniting", true);
+  logMessage("IgniteCommand set after %d", elapsed);
 }
 
 
@@ -412,9 +417,11 @@ void startExtinguishCommand() {
   digitalWrite(RELAIS1, LOW);
   digitalWrite(RELAIS2, LOW);
   digitalWrite(RELAIS3, LOW);
+  unsigned long elapsed = getElapsedMillis();
   resetCmdStartTime();
   currentCmdState = CMD_EXTINGUISH;
-  logMessage("ExtinguishCommand set");
+  writeTopic("homie/5/" + deviceId + "/pilot/status", "extinguishing", true);
+  logMessage("ExtinguishCommand set after %d", elapsed);
 }
 
 
@@ -424,9 +431,10 @@ void startHigherCommand() {
   digitalWrite(RELAIS1, LOW);
   digitalWrite(RELAIS2, HIGH);
   digitalWrite(RELAIS3, HIGH);
+  unsigned long elapsed = getElapsedMillis();
   resetCmdStartTime();
   currentCmdState = CMD_HIGHER;
-  logMessage("HigherCommand set");
+  logMessage("HigherCommand set after %d", elapsed);
 }
 
 
@@ -436,9 +444,10 @@ void startLowerCommand() {
   digitalWrite(RELAIS1, HIGH);
   digitalWrite(RELAIS2, HIGH);
   digitalWrite(RELAIS3, LOW);
+  unsigned long elapsed = getElapsedMillis();
   resetCmdStartTime();
   currentCmdState = CMD_LOWER;
-  logMessage("LowerCommand set");
+  logMessage("LowerCommand set after %d", elapsed);
 }
 
 
@@ -451,6 +460,8 @@ void setTargetPositionPerc(int newTarget) {
   if (newTarget > 100) newTarget = 100;
   if (newTarget < 0)   newTarget = 0;
 
+  writeTopic("homie/5/" + deviceId + "/burner/value/$target", String(newTarget), true);
+
   if (newTarget == 0) {
     targetPositionPerc = 0;
     targetPositionMillis = 0;
@@ -460,7 +471,8 @@ void setTargetPositionPerc(int newTarget) {
         1, 100,
         max(0, POSITION_USER_MIN), min(POSITION_USER_MAX, POSITION_RANGE_MAX)
     );
-  }
+  };
+  logMessage("new target set: %d%%, %d ms", targetPositionPerc, targetPositionMillis);
 }
 
 
@@ -479,6 +491,7 @@ void checkCommandStatus() {
         // Extinguish command is complete, stop the command and move to the delay state
         endCommand();
         currentCmdState = CMD_EXTINGUISH_DELAY;
+        logMessage("Extinguish-delay started");
       }
       return; // nothing more to do here
 
@@ -489,9 +502,14 @@ void checkCommandStatus() {
         return;
       }
       // Extinguish command is complete, delay has passed, so we're idle now
+      logMessage("Extinguish-delay finished");
+      writeTopic("homie/5/" + deviceId + "/pilot/status", (isPilotOn() ? "on" : "off"), true);
+      if (isPilotOn()) {
+        logMessage("WARN: extinguishing seems to have failed!");
+      }
       currentPosition = POSITION_AFTER_IGNITE;
       currentCmdState = CMD_IDLE;
-      break;
+      return; // nothing more to do here
 
 
     case CMD_IGNITE:
@@ -499,6 +517,7 @@ void checkCommandStatus() {
         // Ignite command is complete, stop the command and move to the delay state
         endCommand();
         currentCmdState = CMD_IGNITE_DELAY;
+        logMessage("Ignite-delay started");
       }
       return; // nothing more to do here
 
@@ -509,8 +528,13 @@ void checkCommandStatus() {
         return;
       }
       // Ignite command is complete, delay has passed, so we're idle now
+      logMessage("Ignite-delay finished");
+      writeTopic("homie/5/" + deviceId + "/pilot/status", (isPilotOn() ? "on" : "off"), true);
+      if (!isPilotOn()) {
+        logMessage("WARN: igniting seems to have failed!");
+      }
       currentCmdState = CMD_IDLE;
-      break;
+      return; // nothing more to do here
 
 
     case CMD_HIGHER:
@@ -605,21 +629,15 @@ String getPilotCmdStatus() {
 
 // Returns the status of the pilot-flame according to the thermocouple.
 // Returns a string with the current user-facing status.
-// Possible values are: "off", "on"
+// Possible values are: "false", "true"
 String getPilotStatus() {
-  return isPilotOn() ? "on" : "off";
+  return isPilotOn() ? "true" : "false";
 }
 
 
 // ----------------------------------------------------------------------------------
-//   MQTT setup
+//   Homie device setup
 // ----------------------------------------------------------------------------------
-
-
-void setupMQTT() {
-  client.setServer(TIESKE_MQTT_SERVER, TIESKE_MQTT_PORT);
-  client.setCallback(callback);
-}
 
 
 // Returns the nth segment of a topic string, where segments are separated by '/'.
@@ -658,9 +676,15 @@ bool isFloat(const String& value) {
   return *endPtr == '\0';
 }
 
+
 // Callback handling subscribed topic values received
 void callback(char* topic, byte* payload, unsigned int length) {
-  logMessage("received MQTT data on: %s", topic);
+  // Convert payload to a null-terminated string
+  char payloadStr[length + 1];  // +1 for the null terminator
+  memcpy(payloadStr, payload, length);
+  payloadStr[length] = '\0';  // Null-terminate the string
+
+  logMessage("received MQTT data on: %s='%s'", topic, payloadStr);
   if (length > 20) { // we expect: true, false, or number 0:100:1
     logMessage("received MQTT payload is too long: %d", length);
     return;
@@ -672,7 +696,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   String nodeId = getTopicSegment(String(topic), 3);
   String propId = getTopicSegment(String(topic), 4);
 
-  if (nodeId == "Pilot") {
+  if (nodeId == "pilot") {
 
     // select by PropertyId
     if (propId == "value") {    // handle topic: ../pilot/value/set
@@ -694,30 +718,30 @@ void callback(char* topic, byte* payload, unsigned int length) {
     } else {
       logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
     }
-    
+
 
   } else if (nodeId == "burner") {
-      // select by PropertyId
-      if (propId == "value") {      // handle topic: ../level/value/set
-        if (!isFloat(value)) {
-          logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
-          return;
-        }
-
-        // convert value to a float and round it to the nearest integer
-        int newTarget = round(value.toFloat());
-        if (newTarget < 0 || newTarget > 100) {
-          logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
-          return;
-        }
-
-        // we're accepting the value, post on $target attribute, and update internal value
-        writeTopic("homie/5/" + deviceId + "/burner/value/$target", value, true);
-        setTargetPositionPerc(newTarget);
-        
-      } else {
-        logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
+    // select by PropertyId
+    if (propId == "value") {      // handle topic: ../level/value/set
+      if (!isFloat(value)) {
+        logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+        return;
       }
+
+      // convert value to a float and round it to the nearest integer
+      int newTarget = round(value.toFloat());
+      if (newTarget < 0 || newTarget > 100) {
+        logMessage("received bad value on '%s/%s/set': '%s'", nodeId, propId, value);
+        return;
+      }
+
+      // we're accepting the value, post on $target attribute, and update internal value
+      writeTopic("homie/5/" + deviceId + "/burner/value/$target", value, true);
+      setTargetPositionPerc(newTarget);
+
+    } else {
+      logMessage("received value on unknown property: '%s/%s/set'", nodeId, propId);
+    }
 
 
   } else {
@@ -726,8 +750,11 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 
+// write a value to a topic, but only if we're connected
 void writeTopic(String topic, String value, bool retain) {
-  client.publish(topic.c_str(), value.c_str(), retain);
+  if (client.connected()) {
+    client.publish(topic.c_str(), value.c_str(), retain);
+  }
 }
 
 // // Function to send large MQTT payload in chunks using beginPublish(), write(), and endPublish()
@@ -814,14 +841,29 @@ void publishHomieDeviceDescription() {
   writeTopic("homie/5/" + deviceId + "/pilot/status", getPilotCmdStatus(), true);
 
   String targetPos = String(getTargetPositionPerc());
-  writeTopic("homie/5/" + deviceId + "/flames/value/$target", targetPos, true);
-  writeTopic("homie/5/" + deviceId + "/flames/value", targetPos, true);
+  writeTopic("homie/5/" + deviceId + "/burner/value/$target", targetPos, true);
+  writeTopic("homie/5/" + deviceId + "/burner/value", targetPos, true);
+
+  logMessage("Published homie 5 device '%s'", deviceId.c_str());
 
   // subscribe to setter topics
-  client.subscribe(("homie/5/" + deviceId + "/*/*/set").c_str(), 1);  // QoS level 1; at least once
+  client.subscribe(("homie/5/" + deviceId + "/+/+/set").c_str(), 1);  // QoS level 1; at least once
+  logMessage("Subscribed to homie 5 device '%s' set topics", deviceId.c_str());
 
   // Mark device as ready
   writeTopic("homie/5/" + deviceId + "/$state", "ready", true);
+  logMessage("Marked homie 5 device '%s' as 'ready'", deviceId.c_str());
+}
+
+
+// ----------------------------------------------------------------------------------
+//   MQTT setup
+// ----------------------------------------------------------------------------------
+
+
+void setupMQTT() {
+  client.setServer(TIESKE_MQTT_SERVER, TIESKE_MQTT_PORT);
+  client.setCallback(callback);
 }
 
 
