@@ -64,7 +64,7 @@ unsigned long errorState = 0;
 #define POSITION_PRECISION      100  // Positioning precision in millis
 #define POSITION_AFTER_IGNITE     0  // Where (in millis) are we after the ignite cycle?
 #define POSITION_RANGE_MAX    12000  // the interval between 100% closed and 100% open in millis
-#define POSITION_USER_MIN      1000  // minimum position to use in millis, user % is mapped between this and POSITION_USER_MAX
+#define POSITION_USER_MIN      4000  // minimum position to use in millis, user % is mapped between this and POSITION_USER_MAX
 #define POSITION_USER_MAX     12000  // maximum position to use in millis, user % is mapped between POSITION_USER_MIN and this
 #define THERMOCOUPLE_INTERVAL  1000  // interval (in millis) for reading thermocouple state (pilot on/off)
 #define THERMOCOUPLE_THRESHOLD   30  // threshold temperature (Celsius) to determine if pilot is on (above) or off (below)
@@ -315,7 +315,18 @@ void checkPilotStatus() {
   bool newState = (c > THERMOCOUPLE_THRESHOLD);
   if (newState != _pilotOnStatus) {
     logMessage("Pilot flame switched to %s", (newState ? "ON" : "OFF"));
+    if (nextCmd == NEXT_NONE) {
+      // if we don't have a "next" command, we update the "value/$target" value
+      // the switch was initiated by the remote-control and not through Homie
+      writeTopic("homie/5/" + deviceId + "/pilot/value/$target", (newState ? "true" : "false"), true);
+    }
+    // set the "value" topic
     writeTopic("homie/5/" + deviceId + "/pilot/value", (newState ? "true" : "false"), true);
+    // update the "status" property, but not if we're in the middle of a delay
+    // inside either of the 2 delays, the status gets updated at the end of the delay
+    if (currentCmdState != CMD_IGNITE_DELAY && currentCmdState != CMD_EXTINGUISH_DELAY) {
+      writeTopic("homie/5/" + deviceId + "/pilot/status", (newState ? "on" : "off"), true);
+    }
     _pilotOnStatus = newState;
   }
 }
@@ -366,6 +377,8 @@ void resetCmdStartTime() {
 // update the curent position based on the delta provided.
 // Will ensure the position stays between 0 and POSITION_RANGE_MAX.
 void updateCurrentPosition(long delta) {
+  static unsigned long lastTimeSet = 0; // ensure on first call we will set the value
+
   if (delta < 0) {
     // subtracting, we were running the valve closed
     if ((-1 * delta) > currentPosition) {
@@ -380,6 +393,31 @@ void updateCurrentPosition(long delta) {
     if (currentPosition > POSITION_RANGE_MAX) {
       currentPosition = POSITION_RANGE_MAX;
     }
+  }
+
+  unsigned long msec = millis();
+  if (msec - lastTimeSet > 1000) {
+    lastTimeSet = msec;
+    // 1 sec passed since last update, so publish a new value
+    // calculate the new value in % and publish it
+    int newPerc;
+    if (currentPosition < POSITION_USER_MIN - POSITION_PRECISION/2) {
+      newPerc = 0;
+
+    } else if (currentPosition < POSITION_USER_MIN) {
+      newPerc = 1;
+
+    } else if (currentPosition >= POSITION_USER_MAX) {
+      newPerc = 100;
+
+    } else {
+      newPerc = map(currentPosition,
+          POSITION_USER_MIN, POSITION_USER_MAX,
+          1, 100
+      );
+    };
+    writeTopic("homie/5/" + deviceId + "/burner/value", String(newPerc), true);
+    logMessage("burner new value: %d%%", newPerc);
   }
 }
 
@@ -507,8 +545,8 @@ void checkCommandStatus() {
       if (isPilotOn()) {
         logMessage("WARN: extinguishing seems to have failed!");
       }
-      currentPosition = POSITION_AFTER_IGNITE;
       currentCmdState = CMD_IDLE;
+      updateCurrentPosition(POSITION_AFTER_IGNITE - currentPosition); // pass the delta to set the absolute AFER_IGNITE position
       return; // nothing more to do here
 
 
@@ -539,25 +577,37 @@ void checkCommandStatus() {
 
     case CMD_HIGHER:
     case CMD_LOWER:
+    case CMD_IDLE:
       // So we seem to be balancing towards a specific position
       resetCmdStartTime();  // update the currentPosition
 
+//logMessage("positions: target=%d  current=%d", targetPositionMillis, currentPosition);
       // we only balance if the pilot is on, otherwise we stay put
       if (isPilotOn()) {
-        if (currentPosition > targetPositionMillis - POSITION_PRECISION/2 &&
-            currentPosition < targetPositionMillis + POSITION_PRECISION/2) {
-          // we're on target position, so we're done
-          endCommand();
+        unsigned long upperBound = targetPositionMillis + POSITION_PRECISION / 2;
+        unsigned long lowerBound = (targetPositionMillis > POSITION_PRECISION / 2) ?
+                                   (targetPositionMillis - POSITION_PRECISION / 2) : 0;
 
-        } else if (getElapsedMillis() > targetPositionMillis) {
+        if (currentPosition >= lowerBound && currentPosition <= upperBound) {
+          // we're on target position, so we're done
+          if (currentCmdState != CMD_IDLE) {
+            endCommand();
+            writeTopic("homie/5/" + deviceId + "/burner/value", String(targetPositionPerc), true);
+          }
+
+        } else if (currentPosition > targetPositionMillis) {
           // we're too high, so switch to lower if not already doing so
           if (currentCmdState != CMD_LOWER) {
+            endCommand();
+            delay(300);
             startLowerCommand();
           }
 
-        } else if (getElapsedMillis() < targetPositionMillis) {
+        } else if (currentPosition < targetPositionMillis) {
           // we're too low, so switch to higher if not already doing so
           if (currentCmdState != CMD_HIGHER) {
+            endCommand();
+            delay(300);
             startHigherCommand();
           }
         }
@@ -953,5 +1003,5 @@ void loop() {
   // Wait for a while, minimum POSITION_PRECISION/4 to ensure we can move the valve
   // without keeping flipping between HIGHER and LOWER.
   // Maximum wait is 100ms to remain responsive to user commands.
-  delay(max(POSITION_PRECISION/4, 100));
+//  delay(max(POSITION_PRECISION/4, 100));
 }
