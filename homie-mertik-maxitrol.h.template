@@ -27,3 +27,21 @@
 #define MAXDO   12  // Data Out in the breakout, MISO on the controllerboard
 #define MAXCS   13  // Chip Select in the breakout, CS on the controllerboard
 #define MAXCLK  14  // Clock in the breakout, SCK on the controllerboard
+
+
+// CONFIG PARAMETERS
+
+// NOTE: the delays much be such that if IGNITE is send while extingishing, it will succesfully ignite right after. And vice versa. If not, increase the delay.
+#define EXTINGUISH_WAIT_DELAY 40000  // After extinguish command how long (in millis) to wait for valve motor to return to start position? AND thermocouple reporting OFF
+#define IGNITE_WAIT_DELAY     30000  // After Ignite command how long (in millis) to wait for fireplace to start and be ready to accept commands? Valve has reached its after-start-state.
+#define POSITION_PRECISION      100  // Positioning precision in millis
+#define POSITION_AFTER_IGNITE  9000  // Where (in millis) are we after the ignite cycle?
+// To find the range-max: use a video recording, that adds a timestamp to the recorded video. Record a cycle from fully closed to fully open, and calculate the exact time.
+#define POSITION_RANGE_MAX     9000  // the interval between fully closed and fully open in millis
+#define POSITION_USER_MIN      4000  // minimum position to use for 1% in millis, user % is mapped between this and POSITION_USER_MAX
+#define POSITION_USER_MAX      9000  // maximum position to use for 100% in millis, user % is mapped between POSITION_USER_MIN and this
+#define THERMOCOUPLE_INTERVAL  1000  // interval (in millis) for reading thermocouple state (pilot on/off)
+#define THERMOCOUPLE_THRESHOLD   30  // threshold temperature (Celsius) to determine if pilot is on (above) or off (below)
+#define THERMOCOUPLE_MAX_TEMP   150  // maximum temperature (Celsius) to consider as valid reading
+#define THERMOCOUPLE_MIN_TEMP     5  // minimum temperature (Celsius) to consider as valid reading
+#define THERMOCOUPLE_MAX_ERROR    5  // minimum number of consequtive errors to consider as a fault (reading temp, as well as range check)

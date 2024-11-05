@@ -6,7 +6,7 @@
 Mertik Maxitrol controller
 ==========================
 
-ESP32 based device to control a gas-fired fire-place that is equiped with a
+ESP8266 based device to control a gas-fired fire-place that is equiped with a
 Mertik Maxitrol remote control. This is based on a GV60 type, but most are
 similar. Check the documentation for the connections.
 
@@ -32,6 +32,15 @@ Commands:
  - enable 2nd burner:    close input 1+2 to common for 1 second
  - shutdown 2nd burner:  close input 2+3 to common for 1 second
 
+Reading pilot status:
+---------------------
+Using a MAX31855 thermocouple reader (Adafruit), with software SPI.
+
+Afaik the fireplace doesn't use a thermocouple, but a thermopile (which are multiple
+thermocouples that together provide enough power to keep a safety valve open).
+
+Based on reported temperature the pilot is considered to be on or off.
+
 */
 
 
@@ -55,22 +64,6 @@ Commands:
 #define THERMOCOUPLE_FAULT_INIT_FAILED  (0x08)     // TC SPI initialization failed
 #define THERMOCOUPLE_FAULT_RANGE        (0x10)     // TC reading out of range
 unsigned long errorState = 0;
-
-
-// CONFIG PARAMETERS
-// NOTE: the delays much be such that if IGNITE is send while extingishing, it will succesfully ignite right after. And vice versa. If not, increase the delay.
-#define EXTINGUISH_WAIT_DELAY 40000  // After extinguish command how long (in millis) to wait for valve motor to return to start position? AND thermocouple reporting OFF
-#define IGNITE_WAIT_DELAY     30000  // After Ignite command how long (in millis) to wait for fireplace to start and be ready to accept commands? Valve has reached its after-start-state.
-#define POSITION_PRECISION      100  // Positioning precision in millis
-#define POSITION_AFTER_IGNITE     0  // Where (in millis) are we after the ignite cycle?
-#define POSITION_RANGE_MAX    12000  // the interval between 100% closed and 100% open in millis
-#define POSITION_USER_MIN      4000  // minimum position to use in millis, user % is mapped between this and POSITION_USER_MAX
-#define POSITION_USER_MAX     12000  // maximum position to use in millis, user % is mapped between POSITION_USER_MIN and this
-#define THERMOCOUPLE_INTERVAL  1000  // interval (in millis) for reading thermocouple state (pilot on/off)
-#define THERMOCOUPLE_THRESHOLD   30  // threshold temperature (Celsius) to determine if pilot is on (above) or off (below)
-#define THERMOCOUPLE_MAX_TEMP   150  // maximum temperature (Celsius) to consider as valid reading
-#define THERMOCOUPLE_MIN_TEMP     5  // minimum temperature (Celsius) to consider as valid reading
-#define THERMOCOUPLE_MAX_ERROR    5  // minimum number of consequtive errors to consider as a fault (reading temp, as well as range check)
 
 
 #define CMD_IDLE                  0  // no command is in progress
@@ -378,6 +371,7 @@ void resetCmdStartTime() {
 // Will ensure the position stays between 0 and POSITION_RANGE_MAX.
 void updateCurrentPosition(long delta) {
   static unsigned long lastTimeSet = 0; // ensure on first call we will set the value
+  static int lastPerc = -1;             // ensure there is a change on first call
 
   if (delta < 0) {
     // subtracting, we were running the valve closed
@@ -416,8 +410,12 @@ void updateCurrentPosition(long delta) {
           1, 100
       );
     };
-    writeTopic("homie/5/" + deviceId + "/burner/value", String(newPerc), true);
-    logMessage("burner new value: %d%%", newPerc);
+
+    if (lastPerc != newPerc) {
+      writeTopic("homie/5/" + deviceId + "/burner/value", String(newPerc), true);
+      logMessage("burner new value: %d%%", newPerc);
+      lastPerc = newPerc;
+    }
   }
 }
 
@@ -648,8 +646,36 @@ void reportErrorState(bool force) {
     return;  // no changes, nothing to report
   }
 
-  // TODO: implement
-  // TODO: upon connecting to mqtt, we need to run this with force = true, to report all errors to the user (and clear old ones)
+  // for each of the THERMOCOUPLE_FAULT_xx flags, we report an error
+  if (errorState & THERMOCOUPLE_FAULT_OPEN) {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-open", "Thermocouple connector is open", true);
+  } else {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-open", "", true);
+  }
+
+  if (errorState & THERMOCOUPLE_FAULT_SHORT_GND) {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-short-gnd", "Thermocouple is shorted to GND", true);
+  } else {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-short-gnd", "", true);
+  }
+
+  if (errorState & THERMOCOUPLE_FAULT_SHORT_VCC) {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-short-vcc", "Thermocouple is shorted to VCC", true);
+  } else {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-short-vcc", "", true);
+  }
+
+  if (errorState & THERMOCOUPLE_FAULT_INIT_FAILED) {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-init-failed", "Thermocouple initialization failed", true);
+  } else {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-init-failed", "", true);
+  }
+
+  if (errorState & THERMOCOUPLE_FAULT_RANGE) {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-range", "Thermocouple reading out of range", true);
+  } else {
+    writeTopic("homie/5/" + deviceId + "/$alert/tc-range", "", true);
+  }
 
   lastReportedErrorState = errorState;
 }
@@ -807,41 +833,40 @@ void writeTopic(String topic, String value, bool retain) {
   }
 }
 
-// // Function to send large MQTT payload in chunks using beginPublish(), write(), and endPublish()
-// // Returns true if successful, false if any error occurs
-// bool writeTopic(String topic, String payload, bool retain) {
-//   size_t totalLength = payload.length();
-//   size_t chunkSize = MQTT_MAX_TRANSFER_SIZE - 215 // accomodate for max 15 bytes overhead
+// Function to send large MQTT payload in chunks using beginPublish(), write(), and endPublish()
+// Returns true if successful, false if any error occurs
+bool writeBigTopic(String topic, String payload, bool retain) {
+  size_t totalLength = payload.length();
 
-//   if (!client.beginPublish(topic.c_str(), totalLength, retain)) {
-//     logMessage("Error: Failed to begin publishing to topic %s", topic.c_str());
-//     return false;
-//   }
+  if (!client.beginPublish(topic.c_str(), totalLength, retain)) {
+    logMessage("Error: Failed to begin publishing to topic %s", topic.c_str());
+    return false;
+  }
 
-//   for (size_t i = 0; i < totalLength; i += chunkSize) {
-//     size_t remainingLength = totalLength - i;
-//     size_t lengthToSend = min(chunkSize, remainingLength);
+  for (size_t i = 0; i < totalLength; i += MQTT_MAX_PACKET_SIZE) {
+    size_t remainingLength = totalLength - i;
+    size_t lengthToSend = min((size_t)MQTT_MAX_PACKET_SIZE, remainingLength);
 
-//     if (client.write((const uint8_t*)payload.c_str() + i, lengthToSend) != lengthToSend) {
-//       logMessage("Error: Failed to send chunk to topic %s", topic.c_str());
-//       client.endPublish();  // Ensure publishing is properly terminated
-//       return false;
-//     }
-//   }
+    if (client.write((const uint8_t*)payload.c_str() + i, lengthToSend) != lengthToSend) {
+      logMessage("Error: Failed to send chunk to topic %s", topic.c_str());
+      client.endPublish();  // Ensure publishing is properly terminated
+      return false;
+    }
+  }
 
-//   if (!client.endPublish()) {
-//     logMessage("Error: Failed to end publishing to topic %s", topic.c_str());
-//     return false;
-//   }
+  if (!client.endPublish()) {
+    logMessage("Error: Failed to end publishing to topic %s", topic.c_str());
+    return false;
+  }
 
-//   return true;
-// }
+  return true;
+}
 
 
 // Write the Homie description to the MQTT topics and subscribe to topics
 void publishHomieDeviceDescription() {
   // mark device for (re)configuration
-  writeTopic("homie/5/" + deviceId + "/$state",                "init", true);
+  writeTopic("homie/5/" + deviceId + "/$state", "init", true);
 
   /* send device description, we're sending the minified and escaped version, the full version is:
   {
@@ -880,8 +905,7 @@ void publishHomieDeviceDescription() {
   }
   */
 
-  // TODO: send this in chunks, it's too large for a single publish
-  writeTopic("homie/5/" + deviceId + "/$description",
+  writeBigTopic("homie/5/" + deviceId + "/$description",
     "{\"name\":\"Smart Fireplace\",\"homie\":\"5.0\",\"version\":1,\"nodes\":{\"pilot\":{\"properties\":{\"value\":{\"datatype\":\"boolean\",\"format\":\"off,on\",\"settable\":true,\"retained\":true},\"status\":{\"datatype\":\"enum\",\"format\":\"off,igniting,on,extinguishing\",\"settable\":false,\"retained\":true}}},\"burner\":{\"properties\":{\"value\":{\"datatype\":\"float\",\"format\":\"0:100:1\",\"settable\":true,\"retained\":true,\"unit\":\"%\"}}}}}",
     true);
 
@@ -899,6 +923,9 @@ void publishHomieDeviceDescription() {
   // subscribe to setter topics
   client.subscribe(("homie/5/" + deviceId + "/+/+/set").c_str(), 1);  // QoS level 1; at least once
   logMessage("Subscribed to homie 5 device '%s' set topics", deviceId.c_str());
+
+  // set/clear alerts
+  reportErrorState(true);
 
   // Mark device as ready
   writeTopic("homie/5/" + deviceId + "/$state", "ready", true);
@@ -989,19 +1016,8 @@ void loop() {
   checkCommandStatus();     // main logic for fire-place control
   reportErrorState(false);  // report any errors to the user
 
-  // startIgniteCommand();
-  // delay(2000);
-  // startHigherCommand();
-  // delay(2000);
-  // startLowerCommand();
-  // delay(2000);
-  // startExtinguishCommand();
-  // delay(2000);
-  // endCommand();
-  // delay(4000);
-
   // Wait for a while, minimum POSITION_PRECISION/4 to ensure we can move the valve
   // without keeping flipping between HIGHER and LOWER.
   // Maximum wait is 100ms to remain responsive to user commands.
-//  delay(max(POSITION_PRECISION/4, 100));
+  delay(max(POSITION_PRECISION/4, 100));
 }
