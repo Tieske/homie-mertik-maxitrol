@@ -208,7 +208,7 @@ void setupThermocouple() {
   delay(500);                           // wait for MAX chip to stabilize at startup
   if (!thermocouple.begin()) {
     logMessage("ERROR: Initializing thermocouple failed!");
-    errorState = errorState & THERMOCOUPLE_FAULT_INIT_FAILED;
+    errorState = errorState | THERMOCOUPLE_FAULT_INIT_FAILED;
     return;
   }
 
@@ -254,25 +254,21 @@ void checkPilotStatus() {
       // set error states accordingly
       if (e & MAX31855_FAULT_OPEN) {
         logMessage("FAULT: Thermocouple is open circuit.");
-        errorState = errorState & THERMOCOUPLE_FAULT_OPEN;
+        errorState = errorState | THERMOCOUPLE_FAULT_OPEN;
       } else {
         errorState = errorState & ~THERMOCOUPLE_FAULT_OPEN;
       }
       if (e & MAX31855_FAULT_SHORT_GND) {
         logMessage("FAULT: Thermocouple is short-circuited to GND.");
-        errorState = errorState & THERMOCOUPLE_FAULT_SHORT_GND;
+        errorState = errorState | THERMOCOUPLE_FAULT_SHORT_GND;
       } else {
         errorState = errorState & ~THERMOCOUPLE_FAULT_SHORT_GND;
       }
       if (e & MAX31855_FAULT_SHORT_VCC) {
         logMessage("FAULT: Thermocouple is short-circuited to VCC.");
-        errorState = errorState & THERMOCOUPLE_FAULT_SHORT_VCC;
+        errorState = errorState | THERMOCOUPLE_FAULT_SHORT_VCC;
       } else {
         errorState = errorState & ~THERMOCOUPLE_FAULT_SHORT_VCC;
-      }
-
-      if (consecutiveReadErrors == THERMOCOUPLE_MAX_ERROR) { // only log once (check for equality!)
-        // TODO: should we forcefully extinguish the pilot flame in this case???
       }
     }
     return;
@@ -291,11 +287,7 @@ void checkPilotStatus() {
     // Handle error only if more than the threshold
     if (consecutiveRangeErrors >= THERMOCOUPLE_MAX_ERROR) {
       logMessage("WARN: Thermocouple reading out of range: %f", c);
-      errorState = errorState & THERMOCOUPLE_FAULT_RANGE;
-
-      if (consecutiveRangeErrors == THERMOCOUPLE_MAX_ERROR) { // only log once (check for equality!)
-        // TODO: should we forcefully extinguish the pilot flame in this case???
-      }
+      errorState = errorState | THERMOCOUPLE_FAULT_RANGE;
     }
     return;
   }
@@ -642,8 +634,12 @@ void checkCommandStatus() {
 // It will only report the changes in errorState, unless force = true, then all will be handled.
 void reportErrorState(bool force) {
   static unsigned long lastReportedErrorState = 0;
-  if (!force && errorState == lastReportedErrorState) {
-    return;  // no changes, nothing to report
+  if (errorState == lastReportedErrorState) {
+    // nothing changed
+    if (!force) {
+      // we're not forced either
+      return;  // so nothing to report
+    }
   }
 
   // for each of the THERMOCOUPLE_FAULT_xx flags, we report an error
@@ -858,7 +854,6 @@ bool writeBigTopic(String topic, String payload, bool retain) {
     logMessage("Error: Failed to end publishing to topic %s", topic.c_str());
     return false;
   }
-
   return true;
 }
 
